@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import math
 
 import torch
@@ -58,6 +59,57 @@ def _match_mlp_name(names, candidates):
     return None
 
 
+def _build_pythia_position_embeddings(model, hidden_states, position_ids):
+    rotary_emb = getattr(model.gpt_neox, "rotary_emb", None)
+    if rotary_emb is None or position_ids is None:
+        return None
+
+    try:
+        return rotary_emb(hidden_states, position_ids)
+    except TypeError:
+        try:
+            return rotary_emb(hidden_states, position_ids=position_ids)
+        except TypeError:
+            return None
+
+
+def _pythia_layer_forward(layer, hidden_states, model, layer_kwargs):
+    layer_signature = getattr(layer, "_sparsellm_forward_signature", None)
+    if layer_signature is None:
+        layer_signature = inspect.signature(layer.forward).parameters
+        layer._sparsellm_forward_signature = layer_signature
+    forward_kwargs = {}
+
+    attention_mask = layer_kwargs.get("attention_mask")
+    if "attention_mask" in layer_signature and attention_mask is not None:
+        forward_kwargs["attention_mask"] = attention_mask
+
+    position_ids = layer_kwargs.get("position_ids")
+    cache_position = layer_kwargs.get("cache_position")
+
+    if position_ids is None:
+        if torch.is_tensor(cache_position):
+            position_ids = cache_position.unsqueeze(0) if cache_position.dim() == 1 else cache_position
+        else:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+    elif torch.is_tensor(position_ids) and position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+
+    if "position_ids" in layer_signature and position_ids is not None:
+        forward_kwargs["position_ids"] = position_ids
+    if "cache_position" in layer_signature and cache_position is not None:
+        forward_kwargs["cache_position"] = cache_position
+
+    if "position_embeddings" in layer_signature:
+        position_embeddings = layer_kwargs.get("position_embeddings")
+        if position_embeddings is None:
+            position_embeddings = _build_pythia_position_embeddings(model, hidden_states, position_ids)
+        if position_embeddings is not None:
+            forward_kwargs["position_embeddings"] = position_embeddings
+
+    return layer(hidden_states, **forward_kwargs)[0]
+
+
 @torch.no_grad()
 def pythia_sparsellm(model, dataloader, dev, args):
     print("Starting ...")
@@ -71,7 +123,7 @@ def pythia_sparsellm(model, dataloader, dev, args):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {"i": 0, "attention_mask": None}
+    cache = {"i": 0, "layer_kwargs": {}}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -81,7 +133,12 @@ def pythia_sparsellm(model, dataloader, dev, args):
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs.get("attention_mask", None)
+            cache["layer_kwargs"] = {
+                "attention_mask": kwargs.get("attention_mask", None),
+                "position_ids": kwargs.get("position_ids", None),
+                "cache_position": kwargs.get("cache_position", None),
+                "position_embeddings": kwargs.get("position_embeddings", None),
+            }
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -97,7 +154,7 @@ def pythia_sparsellm(model, dataloader, dev, args):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
+    layer_kwargs = cache["layer_kwargs"]
 
     print("Ready.")
 
@@ -125,7 +182,7 @@ def pythia_sparsellm(model, dataloader, dev, args):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = _pythia_layer_forward(layer, inps[j].unsqueeze(0), model, layer_kwargs)
         for h in handles:
             h.remove()
 
@@ -348,7 +405,7 @@ def pythia_sparsellm(model, dataloader, dev, args):
             gpts[fc2_name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = _pythia_layer_forward(layer, inps[j].unsqueeze(0), model, layer_kwargs)
 
         layers[i] = layer.cpu()
         del layer
@@ -375,7 +432,7 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {"i": 0, "attention_mask": None}
+    cache = {"i": 0, "layer_kwargs": {}}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -385,7 +442,12 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs.get("attention_mask", None)
+            cache["layer_kwargs"] = {
+                "attention_mask": kwargs.get("attention_mask", None),
+                "position_ids": kwargs.get("position_ids", None),
+                "cache_position": kwargs.get("cache_position", None),
+                "position_embeddings": kwargs.get("position_embeddings", None),
+            }
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -402,7 +464,7 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
+    layer_kwargs = cache["layer_kwargs"]
 
     for i in range(len(layers)):
         print(i)
@@ -416,7 +478,7 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
                 W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = _pythia_layer_forward(layer, inps[j].unsqueeze(0), model, layer_kwargs)
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
