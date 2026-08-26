@@ -20,11 +20,13 @@ class SparseGPT_Pythia(SparseGPT_OPT):
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
 
+        ###### added code
         if name in ["mlp.dense_h_to_4h", "mlp.dense_4h_to_h", "dense_h_to_4h", "dense_4h_to_h"]:
             self.batch_inp.append(inp[0].clone().detach())
             if len(out.shape) == 3:
                 out = out.squeeze(0)
             self.batch_out.append(out.clone().detach())
+        ######
 
         tmp = inp.shape[0]
         if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
@@ -179,6 +181,9 @@ def pythia_sparsellm(model, dataloader, dev, args):
             Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
 
             for opt_step in range(opt_epochs):
+                ##############
+                # optimize W
+                ##############
                 if opt_step > 0:
                     fc1_bias = subset[fc1_name].bias
                     if fc1_bias is None:
@@ -210,6 +215,9 @@ def pythia_sparsellm(model, dataloader, dev, args):
                     del bias, weight_matrix_2, y_pred
                     torch.cuda.empty_cache()
 
+                ##############
+                # prune W
+                ##############
                 if opt_step > 0:
                     tmp_H = torch.zeros_like(gpts[fc2_name].H)
                     tmp_p = p.T.reshape((args.nsamples, -1, p.size(0)))
@@ -254,6 +262,9 @@ def pythia_sparsellm(model, dataloader, dev, args):
                             blocksize=args.blocksize,
                         )
 
+                ##############
+                # optimize p
+                ##############
                 next_weight = subset[fc2_name].weight
                 m1 = beta * torch.matmul(next_weight.T, next_weight)
                 m2 = gamma * torch.eye(m1.shape[0], device=m1.device)
@@ -283,6 +294,9 @@ def pythia_sparsellm(model, dataloader, dev, args):
                 del av, af
                 torch.cuda.empty_cache()
 
+                ##############
+                # optimize z
+                ##############
                 w = subset[fc1_name].weight
                 fc1_bias = subset[fc1_name].bias
                 if fc1_bias is None:
