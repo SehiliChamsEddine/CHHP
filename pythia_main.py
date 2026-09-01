@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import math
 
 import torch
@@ -58,6 +59,55 @@ def _match_mlp_name(names, candidates):
     return None
 
 
+def _extract_hidden_states(layer_output):
+    if isinstance(layer_output, tuple):
+        return layer_output[0]
+    return layer_output
+
+
+def _build_position_embeddings(model, hidden_states, position_ids):
+    rotary_emb = getattr(model.gpt_neox, "rotary_emb", None)
+    if rotary_emb is None:
+        return None
+
+    try:
+        return rotary_emb(hidden_states, position_ids)
+    except TypeError:
+        pass
+    try:
+        return rotary_emb(hidden_states, position_ids=position_ids)
+    except TypeError:
+        pass
+    try:
+        return rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
+    except TypeError:
+        return None
+
+
+def _get_neox_layer_kwargs(layer, model, hidden_states, attention_mask, position_ids=None, position_embeddings=None, cache_position=None):
+    params = inspect.signature(layer.forward).parameters
+    kwargs = {}
+
+    if "attention_mask" in params:
+        kwargs["attention_mask"] = attention_mask
+
+    if "position_ids" in params:
+        if position_ids is None:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long).unsqueeze(0)
+        kwargs["position_ids"] = position_ids
+
+    if "cache_position" in params and cache_position is not None:
+        kwargs["cache_position"] = cache_position
+
+    if "position_embeddings" in params:
+        if position_embeddings is None:
+            position_embeddings = _build_position_embeddings(model, hidden_states, kwargs.get("position_ids", position_ids))
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+
+    return kwargs
+
+
 @torch.no_grad()
 def pythia_sparsellm(model, dataloader, dev, args):
     print("Starting ...")
@@ -71,17 +121,20 @@ def pythia_sparsellm(model, dataloader, dev, args):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {"i": 0, "attention_mask": None}
+    cache = {"i": 0, "attention_mask": None, "position_ids": None, "position_embeddings": None, "cache_position": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
 
-        def forward(self, inp, **kwargs):
+        def forward(self, inp, *args, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs.get("attention_mask", None)
+            cache["position_ids"] = kwargs.get("position_ids", None)
+            cache["position_embeddings"] = kwargs.get("position_embeddings", None)
+            cache["cache_position"] = kwargs.get("cache_position", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -98,6 +151,9 @@ def pythia_sparsellm(model, dataloader, dev, args):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
+    position_embeddings = cache["position_embeddings"]
+    cache_position = cache["cache_position"]
 
     print("Ready.")
 
@@ -125,7 +181,17 @@ def pythia_sparsellm(model, dataloader, dev, args):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            layer_inp = inps[j].unsqueeze(0)
+            layer_kwargs = _get_neox_layer_kwargs(
+                layer,
+                model,
+                layer_inp,
+                attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                cache_position=cache_position,
+            )
+            outs[j] = _extract_hidden_states(layer(layer_inp, **layer_kwargs))
         for h in handles:
             h.remove()
 
@@ -348,7 +414,17 @@ def pythia_sparsellm(model, dataloader, dev, args):
             gpts[fc2_name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            layer_inp = inps[j].unsqueeze(0)
+            layer_kwargs = _get_neox_layer_kwargs(
+                layer,
+                model,
+                layer_inp,
+                attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                cache_position=cache_position,
+            )
+            outs[j] = _extract_hidden_states(layer(layer_inp, **layer_kwargs))
 
         layers[i] = layer.cpu()
         del layer
@@ -375,17 +451,20 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {"i": 0, "attention_mask": None}
+    cache = {"i": 0, "attention_mask": None, "position_ids": None, "position_embeddings": None, "cache_position": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
 
-        def forward(self, inp, **kwargs):
+        def forward(self, inp, *args, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs.get("attention_mask", None)
+            cache["position_ids"] = kwargs.get("position_ids", None)
+            cache["position_embeddings"] = kwargs.get("position_embeddings", None)
+            cache["cache_position"] = kwargs.get("cache_position", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -403,6 +482,9 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
+    position_embeddings = cache["position_embeddings"]
+    cache_position = cache["cache_position"]
 
     for i in range(len(layers)):
         print(i)
@@ -416,7 +498,17 @@ def pythia_eval(model, testenc, dev, args, dataset: str):
                 W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            layer_inp = inps[j].unsqueeze(0)
+            layer_kwargs = _get_neox_layer_kwargs(
+                layer,
+                model,
+                layer_inp,
+                attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                cache_position=cache_position,
+            )
+            outs[j] = _extract_hidden_states(layer(layer_inp, **layer_kwargs))
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
