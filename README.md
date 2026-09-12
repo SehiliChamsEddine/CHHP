@@ -1,311 +1,177 @@
 # VHHP: Structural-Prior-Augmented Hessian Pruning for Large Language Models
 
-> **Repository naming note.** This repository is referred to as **VHHP**.  
-> In the current manuscript, the framework is named **Contrast-Hessian Hybrid Pruning (CHHP)**. The implementation and equations described below follow the current manuscript.
+This repository contains the implementation of our Hessian-based post-training pruning framework for large language models. The codebase is built on top of **SparseLLM** and uses the **SparseGPT / Optimal Brain Surgeon (OBS)** recovery mechanism.
 
-VHHP is a post-training pruning framework for large language models built on top of **SparseLLM** and **SparseGPT**.
+> **Naming note:** the current manuscript refers to the method as **Contrast-Hessian Hybrid Pruning (CHHP)**. This repository is named **VHHP**.
 
-The central idea is simple: the standard SparseGPT / Optimal Brain Surgeon (OBS) importance score is a strong second-order measure of the local reconstruction cost of pruning a weight, but it evaluates each weight largely in isolation. VHHP augments that score with two structural priors computed from information already available during Hessian-based pruning:
+VHHP improves the SparseGPT pruning score by adding two lightweight structural priors computed from the same calibration Hessian:
 
-1. **Contrast Manifold** — emphasizes weights that are dominant within their local row/neuron and suppresses background weights.
-2. **Feature Uniqueness** — penalizes weights connected to highly correlated, redundant input channels.
+- **Contrast Manifold**: emphasizes row-dominant weights and suppresses weak background weights.
+- **Feature Uniqueness**: penalizes weights connected to highly correlated, redundant input channels.
 
-These two priors are fused multiplicatively with the OBS score into a **Champion Score** used for mask selection. The standard OBS compensation/recovery step is then applied unchanged.
+The two priors are fused with the OBS score into a **Champion Score** used for mask selection. The standard OBS compensation step is then applied unchanged.
 
-No backpropagation or retraining is required.
-
----
-
-## Overview
-
-For a layer with weight matrix \(W\) and calibration activations \(X\), SparseGPT constructs the damped empirical Hessian
-
-\[
-H = XX^\top + \lambda I.
-\]
-
-The standard OBS / SparseGPT importance score is
-
-\[
-S^{\text{base}}_{ki}
-=
-\frac{w_{ki}^{2}}
-     {[H^{-1}]_{ii}}.
-\]
-
-This score captures second-order sensitivity, but it does not explicitly distinguish:
-
-- a weight that is dominant relative to the other weights in its row from one that is merely background magnitude, or
-- a weight connected to a unique input feature from one connected to a highly redundant feature.
-
-VHHP adds both signals before pruning.
+No retraining or backpropagation is required.
 
 ---
 
 ## Method
 
-### 1. OBS Base Score
+For a weight matrix \(W\) and calibration activations \(X\), the damped empirical Hessian is
 
-The starting point is the SparseGPT / OBS score:
+$$
+H = XX^\top + \lambda I.
+$$
 
-\[
-S^{\text{base}}_{ki}
+SparseGPT uses the OBS importance score
+
+$$
+S^{\mathrm{base}}_{ki}
 =
 \frac{w_{ki}^{2}}
-     {[H^{-1}]_{ii}}.
-\]
+{[H^{-1}]_{ii}}.
+$$
 
-This estimates the local reconstruction cost of removing \(w_{ki}\) under the quadratic approximation used by OBS.
+VHHP augments this score with two structural terms.
 
----
+### Contrast Manifold
 
-### 2. Contrast Manifold
+Weights are normalized within each row:
 
-Weights are normalized within each output row:
-
-\[
+$$
 \bar{w}_{ki}
 =
 \frac{|w_{ki}|}
-     {\max_j |w_{kj}| + \varepsilon}.
-\]
+{\max_j |w_{kj}| + \varepsilon}.
+$$
 
-The normalized magnitude is then sharpened with an odd-power contrast function:
+The normalized values are sharpened using
 
-\[
+$$
 V_{ki}
 =
 \bar{w}_{ki}^{\,2n+1}.
-\]
+$$
 
-The purpose of this transformation is to preserve row-dominant weights while strongly suppressing weights whose magnitude is small relative to the strongest weight in the same row.
+This preserves dominant weights while strongly suppressing weights that are small relative to the maximum magnitude in the same row.
 
-For example, with \(n=3\), the exponent is \(7\). A normalized weight of \(0.5\) becomes
+### Feature Uniqueness
 
-\[
-0.5^7 \approx 0.0078,
-\]
+The Hessian is normalized into a correlation matrix:
 
-while the row maximum remains \(1\).
-
----
-
-### 3. Feature Uniqueness
-
-The calibration Hessian also contains cross-channel information.
-
-First, normalize it into a correlation matrix:
-
-\[
+$$
 C_{ij}
 =
 \frac{H_{ij}}
-     {\sqrt{H_{ii}H_{jj}}}.
-\]
+{\sqrt{H_{ii}H_{jj}}}.
+$$
 
-The accumulated redundancy of input channel \(i\) is
+The redundancy of channel \(i\) is
 
-\[
-R_i
-=
-\sum_j |C_{ij}|.
-\]
+$$
+R_i = \sum_j |C_{ij}|,
+$$
 
-The corresponding Feature Uniqueness score is
+and the Feature Uniqueness score is
 
-\[
-U_i
-=
+$$
+U_i =
 \frac{1}{\log(1 + R_i)}.
-\]
+$$
 
-A channel that is strongly correlated with many other channels receives a smaller uniqueness value, while a more independent channel receives a larger survival prior.
+Highly correlated input channels receive a smaller uniqueness score.
 
-This is a correlation-based redundancy heuristic; it is not an information-theoretic entropy or mutual-information estimate.
+### Champion Score
 
----
+The final pruning score is
 
-### 4. Champion Score
-
-The final pruning score combines the three signals multiplicatively:
-
-\[
-S^{\text{final}}_{ki}
+$$
+S^{\mathrm{final}}_{ki}
 =
-S^{\text{base}}_{ki}
-\left(
-V_{ki} U_i
-\right)^\alpha.
-\]
+S^{\mathrm{base}}_{ki}
+\left(V_{ki} U_i\right)^\alpha.
+$$
 
 where:
 
-- \(S^{\text{base}}\) is the exact OBS-derived second-order score,
-- \(V\) is the Contrast Manifold factor,
-- \(U\) is the Feature Uniqueness factor,
-- \(\alpha\) controls the strength of the structural priors.
+- \(S^{\mathrm{base}}\): SparseGPT / OBS second-order importance.
+- \(V_{ki}\): Contrast Manifold score.
+- \(U_i\): Feature Uniqueness score.
+- \(\alpha\): structural-prior blending factor.
 
-Typical settings described in the manuscript are:
-
-- \(\alpha = 1.0\): full structural fusion,
-- \(\alpha = 0.35\): conservative / tie-breaking regime,
-- \(\alpha = 0\): recovers the plain OBS/SparseGPT score.
-
-The multiplicative form acts like an **AND gate**: a weight should be important according to curvature, local magnitude contrast, and feature uniqueness in order to receive a high final score.
+The mask is selected using the Champion Score, after which the original OBS recovery update is applied without modification.
 
 ---
 
-## Two-Stage Pruning
+## MLP-Aware Hybrid Pruning
 
-VHHP deliberately separates **mask selection** from **weight recovery**.
-
-### Stage 1 — Structural mask selection
-
-The Champion Score is computed using the original frozen pretrained weights.
-
-The top-\((1-p)\) fraction of scores is retained, producing a binary mask \(M\), where \(p\) is the target sparsity.
-
-### Stage 2 — OBS recovery
-
-Once the mask is fixed, the original SparseGPT / OBS compensation step is used without changing its mathematics:
-
-\[
-\delta w
-=
--
-\frac{w_{ki}}
-     {[H^{-1}]_{ii}}
-H^{-1}_{:,i}.
-\]
-
-This lets VHHP alter **which weights are selected for pruning** while preserving the standard second-order recovery mechanism.
-
----
-
-## Integration with SparseLLM
-
-This repository is forked from **SparseLLM**.
-
-SparseLLM provides a global multi-layer ADMM orchestration framework. In this project, VHHP is used as the **local pruning solver** inside that outer optimization loop.
-
-Conceptually:
+The current best-performing configuration applies VHHP to the **MLP sublayers** while keeping standard SparseGPT scoring for **multi-head attention**.
 
 ```text
-Calibration activations
-        |
-        v
-Hessian construction
-H = X X^T + lambda I
-        |
-        v
-Hessian inversion
-        |
-        +-----------------------------+
-        |                             |
-        v                             v
-Attention sublayers             MLP sublayers
-SparseGPT / OBS score           VHHP Champion Score
-        |                             |
-        +-------------+---------------+
-                      |
-                      v
-                 Global mask
-                      |
-                      v
-              OBS prune + compensate
-                      |
-                      v
-              SparseLLM ADMM loop
+Transformer Layer
+│
+├── Attention
+│   ├── q_proj  ── SparseGPT / OBS
+│   ├── k_proj  ── SparseGPT / OBS
+│   ├── v_proj  ── SparseGPT / OBS
+│   └── out_proj ─ SparseGPT / OBS
+│
+└── MLP
+    ├── fc1 ── VHHP Champion Score
+    └── fc2 ── VHHP Champion Score
 ```
 
-The current best-performing configuration applies the structural VHHP/CHHP score to **MLP sublayers** (`fc1`, `fc2`) and retains vanilla SparseGPT / OBS scoring for **multi-head attention** projections.
+This distinction is important because query and key projections are coupled inside the attention softmax, while the current VHHP score operates on one weight matrix at a time.
 
 ---
 
-## Why MLP-Only?
+## SparseLLM Integration
 
-The current single-matrix formulation works best on MLP sublayers.
+VHHP is implemented as a modified local pruning solver inside the **SparseLLM ADMM framework**.
 
-For an MLP block, row-wise weight contrast and input-channel redundancy can be treated locally with reasonable effectiveness.
-
-Multi-head attention is different. Query and key projections interact jointly inside the softmax:
-
-\[
-\operatorname{softmax}
-\left(
-\frac{QK^\top}{\sqrt{d_k}}
-\right),
-\]
-
-so independently scoring \(W_Q\) and \(W_K\) ignores an important cross-matrix dependency.
-
-For this reason, the current recommended configuration is:
+The overall pipeline is:
 
 ```text
-MHA: SparseGPT / OBS
-MLP: VHHP / CHHP Champion Score
+Calibration data
+      │
+      ▼
+Construct Hessian
+      │
+      ▼
+Compute pruning scores
+      │
+      ├── Attention → SparseGPT / OBS
+      │
+      └── MLP       → VHHP Champion Score
+      │
+      ▼
+Select pruning mask
+      │
+      ▼
+OBS compensation
+      │
+      ▼
+SparseLLM ADMM coordination
 ```
 
-The manuscript proposes coupled QK/VO masking, head-level contrast, per-head entropy/uniqueness, and an adaptive contrast schedule as future extensions. These extensions are not part of the current evaluated implementation.
+The structural terms add only
 
----
+- \(O(d_{\mathrm{in}}^2)\) work for Hessian correlations, and
+- \(O(d_{\mathrm{out}}d_{\mathrm{in}})\) work for Contrast scores.
 
-## Complexity
-
-For each layer, the additional VHHP operations are:
-
-- \(O(d_{\text{in}}^2)\) for the correlation matrix and redundancy sums,
-- \(O(d_{\text{out}}d_{\text{in}})\) for the Contrast scores.
-
-These terms are dominated by the Hessian inversion / Cholesky work already required by SparseGPT.
-
-Therefore, VHHP has the same **asymptotic complexity class** as the underlying SparseGPT solver.
-
----
-
-## Numerical Stability
-
-High contrast exponents can produce very small values.
-
-For stable FP16 execution, the score can be evaluated in log space:
-
-\[
-\log S^{\text{final}}_{ki}
-=
-\log S^{\text{base}}_{ki}
-+
-\alpha
-\left[
-(2n+1)\log \bar{w}_{ki}
-+
-\log U_i
-\right].
-\]
-
-This preserves ranking while avoiding numerical underflow.
-
----
-
-## Code Parameterization Note
-
-The theoretical notation in the manuscript uses
-
-\[
-V_{ki} = \bar{w}_{ki}^{2n+1}.
-\]
-
-Some implementation paths expose the contrast exponent directly through a code parameter named `ncontrast`.
-
-These parameterizations are related, but **`ncontrast` should not automatically be interpreted as the manuscript variable `n`**. Check the implementation path being used before reproducing an experiment.
+These operations do not change the asymptotic complexity of the SparseGPT pruning step.
 
 ---
 
 ## Dependencies
 
-The project inherits the SparseLLM software stack. The base repository reports the following tested versions:
+The repository inherits the SparseLLM software stack.
+
+Tested upstream versions include:
 
 - Python 3.10.14
-- PyTorch 2.4.1 with CUDA 12.4
+- PyTorch 2.4.1
+- CUDA 12.4
 - Transformers 4.45.1
 - Datasets 3.0.1
 - NumPy 2.1.1
@@ -313,15 +179,13 @@ The project inherits the SparseLLM software stack. The base repository reports t
 - huggingface_hub 0.25.1
 - wandb 0.18.2
 
-Install the repository dependencies according to your local CUDA/PyTorch environment.
-
 ---
 
 ## Usage
 
-The repository retains the SparseLLM-style OPT entry point.
+The repository keeps the SparseLLM-style OPT entry point.
 
-A basic OPT pruning run follows the original SparseLLM interface:
+### Example: OPT-125M
 
 ```bash
 python opt_main.py \
@@ -330,155 +194,84 @@ python opt_main.py \
     --sparsity 0.8
 ```
 
-The modified local solver implements the VHHP/CHHP scoring path inside the pruning engine.
-
-### Main inherited arguments
+Main inherited arguments:
 
 - `--model`: Hugging Face model identifier.
-- `--dataset`: calibration/evaluation dataset, such as `c4`, `wikitext2`, or `ptb`.
-- `--sparsity`: target fraction of weights to prune.
+- `--dataset`: calibration/evaluation dataset.
+- `--sparsity`: target sparsity level.
 
-### VHHP-specific configuration
+The modified pruning implementation contains the VHHP/CHHP scoring path used for MLP pruning.
 
-The current manuscript describes the following method-level parameters:
+### Contrast Parameter
 
-- `n` / contrast exponent: controls Contrast Manifold sharpness.
-- `ncontrast`: exponent parameter exposed by some code paths.
-- `alpha`: blend strength for the structural priors.
-- damping: `percdamp = 0.01 * mean(diag(H))`.
-- numerical stabilizer: approximately \(10^{-8}\) to \(10^{-9}\).
-- OBS block size: 128 columns.
+The implementation exposes the contrast strength through the code-level parameter `ncontrast`.
 
-> **Important:** the paper documents the code-level quantity `ncontrast`, but it does not fully specify the command-line spelling of every modified-repository option. The exact CLI examples should be synchronized with the repository's `argparse` definitions before release.
+The manuscript expresses the Contrast Manifold as
+
+$$
+V_{ki} = \bar{w}_{ki}^{\,2n+1}.
+$$
+
+The paper and code use slightly different indexing conventions for this exponent, so reproduction should follow the parameterization implemented in the repository.
 
 ---
 
-## Experimental Setup in the Manuscript
+## Experimental Setup
 
-The current evaluation uses OPT models:
+The manuscript evaluates the method on the OPT family.
 
-| Model | Calibration dataset | Calibration samples | Evaluated sparsity |
+| Model | Calibration | Samples | Sparsity |
 |---|---|---:|---|
 | OPT-125M | C4 | 128 | 50%–95% |
-| OPT-1.3B | C4 | 30 | 50%, 60%, 70%, 80%, 90% |
-| OPT-2.7B | C4 | 30 | 50%, 60%, 70%, 80%, 90% |
+| OPT-1.3B | C4 | 30 | 50%–90% |
+| OPT-2.7B | C4 | 30 | 50%–90% |
 | OPT-6.7B | C4 | 10 | 40%–80% |
 
 Perplexity is evaluated on **WikiText-2** and **C4** with sequence length 2048.
-
-The base SparseLLM repository also contains LLaMA entry points, but the current VHHP/CHHP results reported in the manuscript are for the OPT family.
 
 ---
 
 ## Representative Results
 
-Under the matched OPT-125M experiment reported in the manuscript:
-
-- target sparsity: **80%**
-- calibration: **C4**
-- calibration samples: **128**
-- seed: **0**
-- attention: vanilla SparseGPT
-- MLP: VHHP/CHHP Champion Score
+Matched comparison on **OPT-125M**, **80% sparsity**, **C4 calibration**, **128 calibration samples**, and **seed 0**:
 
 | Method | WikiText-2 PPL ↓ | C4 PPL ↓ |
 |---|---:|---:|
-| Magnitude pruning | 4859.41 | 2444.93 |
+| Magnitude | 4859.41 | 2444.93 |
 | SparseGPT / OBS | 1686.32 | 857.79 |
 | Wanda | 1183.86 | 600.80 |
 | SparseGPT-attn + VHHP/CHHP-MLP | **819.92** | **469.52** |
 
-In that matched run, the hybrid MLP configuration improves perplexity by approximately:
+Under this protocol, the hybrid VHHP configuration improves over SparseGPT / OBS by approximately:
 
-- **51.3%** relative to SparseGPT/OBS on WikiText-2,
-- **45.3%** relative to SparseGPT/OBS on C4,
-- **30.7%** relative to Wanda on WikiText-2,
-- **21.9%** relative to Wanda on C4.
+- **51.3%** on WikiText-2.
+- **45.3%** on C4.
 
-The manuscript also reports strong improvements for OPT-125M across the moderate/high sparsity regime and an MLP-only improvement in a pilot OPT-6.7B experiment.
+It also improves over Wanda by approximately:
 
----
-
-## Important Experimental Caveats
-
-The current results should be interpreted with the scope of the manuscript in mind:
-
-1. **MLP vs. attention**  
-   The current structural score improves MLP pruning but does not improve MHA pruning. The recommended implementation therefore falls back to SparseGPT for attention.
-
-2. **Scale dependence**  
-   Gains do not transfer uniformly to billion-parameter models at high sparsity. Performance deteriorates beyond roughly the 70% sparsity region in the reported billion-scale experiments.
-
-3. **Extreme sparsity**  
-   Fixed contrast settings become fragile near 95% sparsity.
-
-4. **Exponent selection**  
-   Several reported “best-\(n\)” results were selected using the same evaluation set used for reporting perplexity. The manuscript proposes a held-out calibration reconstruction criterion for deployment-time selection, but that gap has not yet been fully evaluated.
-
-5. **Single-run measurements**  
-   Reported perplexities are currently based on single runs rather than variance estimates across multiple calibration draws/seeds.
-
-6. **Baseline variation**  
-   The manuscript notes that nominally similar OPT-125M / 80% / C4 baseline measurements differ across some reported experiments. Results should therefore be interpreted according to their exact experimental protocol.
+- **30.7%** on WikiText-2.
+- **21.9%** on C4.
 
 ---
 
-## Held-Out Selection of the Contrast Exponent
+## Current Scope
 
-For deployment, the manuscript proposes choosing the contrast order using only calibration data.
+The current implementation is most effective when the structural score is applied to **MLP sublayers**.
 
-Split calibration activations into fitting and validation subsets:
+The manuscript reports that:
 
-\[
-X = X_{\text{fit}} \cup X_{\text{val}}.
-\]
+- MLP pruning benefits from the added structural priors.
+- Applying the same single-matrix score directly to attention does not provide the same benefit.
+- Performance becomes scale- and sparsity-dependent for billion-parameter models beyond roughly 70% sparsity.
+- Extreme sparsity can require more careful selection of the contrast exponent.
 
-For each candidate contrast order \(n\):
-
-1. build the Hessian using \(X_{\text{fit}}\),
-2. prune the layer,
-3. apply OBS correction,
-4. compute held-out reconstruction error
-
-\[
-E(n)
-=
-\left\|
-WX_{\text{val}}
--
-\hat{W}^{(n)}X_{\text{val}}
-\right\|_F^2.
-\]
-
-Then choose
-
-\[
-n^\star
-=
-\arg\min_n E(n).
-\]
-
-This avoids selecting the exponent directly from downstream test perplexity.
-
----
-
-## Repository Lineage
-
-This implementation is built on top of:
-
-- **SparseLLM** — global ADMM-based multi-layer pruning orchestration.
-- **SparseGPT** — second-order OBS-style local pruning and weight compensation.
-- **Wanda** — included in the lineage of the original SparseLLM repository and used as a comparison baseline.
-
-VHHP modifies the local mask-selection criterion while retaining the surrounding SparseLLM/SparseGPT machinery.
+Future extensions proposed in the manuscript include coupled QK/VO masking, head-level contrast, per-head uniqueness, and adaptive contrast scheduling.
 
 ---
 
 ## Citation
 
-If you use this implementation, please cite the VHHP/CHHP work and the upstream SparseLLM project.
-
-### VHHP / CHHP
+If you use this code in your research, please cite our work:
 
 ```bibtex
 @misc{sehili2026chhp,
@@ -489,7 +282,7 @@ If you use this implementation, please cite the VHHP/CHHP work and the upstream 
 }
 ```
 
-### SparseLLM
+Please also cite SparseLLM:
 
 ```bibtex
 @inproceedings{bai2024sparsellm,
@@ -504,14 +297,6 @@ If you use this implementation, please cite the VHHP/CHHP work and the upstream 
 
 ## Acknowledgements
 
-This repository is forked from **SparseLLM** and uses the SparseGPT/OBS pruning machinery as its second-order recovery backbone.
+This repository is forked from **SparseLLM** and builds on the **SparseGPT / OBS** pruning framework.
 
-We thank the authors of SparseLLM, SparseGPT, Wanda, and the broader open-source model-compression community for making their implementations available.
-
----
-
-## Current Scope
-
-VHHP/CHHP should currently be understood as a **structural-prior extension to second-order pruning for MLP sublayers**, not as a universal replacement for SparseGPT across every Transformer component.
-
-The main research result is that structural information already present in the Hessian can improve mask selection without retraining and without changing the asymptotic complexity of the SparseGPT recovery pipeline.
+We thank the authors of SparseLLM, SparseGPT, Wanda, and the broader open-source model-compression community for making their work publicly available.
