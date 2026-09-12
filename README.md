@@ -17,89 +17,82 @@ No retraining or backpropagation is required.
 
 ## Method
 
-For a weight matrix \(W\) and calibration activations \(X\), the damped empirical Hessian is
+For a weight matrix `W` and calibration activations `X`, the damped empirical Hessian is:
 
-$$
-H = XX^\top + \lambda I.
-$$
+```text
+H = X X^T + lambda I
+```
 
-SparseGPT uses the OBS importance score
+SparseGPT uses the OBS importance score:
 
-$$
-S^{\mathrm{base}}_{ki}
-=
-\frac{w_{ki}^{2}}
-{[H^{-1}]_{ii}}.
-$$
+```text
+S_base(k, i) = w(k, i)^2 / [H^(-1)](i, i)
+```
 
 VHHP augments this score with two structural terms.
 
-### Contrast Manifold
+### 1. Contrast Manifold
 
 Weights are normalized within each row:
 
-$$
-\bar{w}_{ki}
-=
-\frac{|w_{ki}|}
-{\max_j |w_{kj}| + \varepsilon}.
-$$
+```text
+w_bar(k, i) = |w(k, i)| / (max_j |w(k, j)| + epsilon)
+```
 
-The normalized values are sharpened using
+The normalized values are sharpened using:
 
-$$
-V_{ki}
-=
-\bar{w}_{ki}^{\,2n+1}.
-$$
+```text
+V(k, i) = w_bar(k, i)^(2n + 1)
+```
 
 This preserves dominant weights while strongly suppressing weights that are small relative to the maximum magnitude in the same row.
 
-### Feature Uniqueness
+### 2. Feature Uniqueness
 
 The Hessian is normalized into a correlation matrix:
 
-$$
-C_{ij}
-=
-\frac{H_{ij}}
-{\sqrt{H_{ii}H_{jj}}}.
-$$
+```text
+C(i, j) = H(i, j) / sqrt(H(i, i) * H(j, j))
+```
 
-The redundancy of channel \(i\) is
+The redundancy of channel `i` is:
 
-$$
-R_i = \sum_j |C_{ij}|,
-$$
+```text
+R(i) = sum_j |C(i, j)|
+```
 
-and the Feature Uniqueness score is
+and the Feature Uniqueness score is:
 
-$$
-U_i =
-\frac{1}{\log(1 + R_i)}.
-$$
+```text
+U(i) = 1 / log(1 + R(i))
+```
 
 Highly correlated input channels receive a smaller uniqueness score.
 
-### Champion Score
+### 3. Champion Score
 
-The final pruning score is
+The final pruning score is:
 
-$$
-S^{\mathrm{final}}_{ki}
-=
-S^{\mathrm{base}}_{ki}
-\left(V_{ki} U_i\right)^\alpha.
-$$
+```text
+S_final(k, i) = S_base(k, i) * ( V(k, i) * U(i) )^alpha
+```
 
 where:
 
-- \(S^{\mathrm{base}}\): SparseGPT / OBS second-order importance.
-- \(V_{ki}\): Contrast Manifold score.
-- \(U_i\): Feature Uniqueness score.
-- \(\alpha\): structural-prior blending factor.
+- `S_base`: SparseGPT / OBS second-order importance.
+- `V(k, i)`: Contrast Manifold score.
+- `U(i)`: Feature Uniqueness score.
+- `alpha`: structural-prior blending factor.
 
 The mask is selected using the Champion Score, after which the original OBS recovery update is applied without modification.
+
+### 4. OBS Recovery
+
+After the mask is fixed, the standard OBS correction is applied:
+
+```text
+delta_w = - ( w(k, i) / [H^(-1)](i, i) ) * H^(-1)(:, i)
+```
 
 ---
 
@@ -111,14 +104,14 @@ The current best-performing configuration applies VHHP to the **MLP sublayers** 
 Transformer Layer
 │
 ├── Attention
-│   ├── q_proj  ── SparseGPT / OBS
-│   ├── k_proj  ── SparseGPT / OBS
-│   ├── v_proj  ── SparseGPT / OBS
-│   └── out_proj ─ SparseGPT / OBS
+│   ├── q_proj   -> SparseGPT / OBS
+│   ├── k_proj   -> SparseGPT / OBS
+│   ├── v_proj   -> SparseGPT / OBS
+│   └── out_proj -> SparseGPT / OBS
 │
 └── MLP
-    ├── fc1 ── VHHP Champion Score
-    └── fc2 ── VHHP Champion Score
+    ├── fc1 -> VHHP Champion Score
+    └── fc2 -> VHHP Champion Score
 ```
 
 This distinction is important because query and key projections are coupled inside the attention softmax, while the current VHHP score operates on one weight matrix at a time.
@@ -140,9 +133,9 @@ Construct Hessian
       ▼
 Compute pruning scores
       │
-      ├── Attention → SparseGPT / OBS
+      ├── Attention -> SparseGPT / OBS
       │
-      └── MLP       → VHHP Champion Score
+      └── MLP       -> VHHP Champion Score
       │
       ▼
 Select pruning mask
@@ -154,10 +147,10 @@ OBS compensation
 SparseLLM ADMM coordination
 ```
 
-The structural terms add only
+The structural terms add only:
 
-- \(O(d_{\mathrm{in}}^2)\) work for Hessian correlations, and
-- \(O(d_{\mathrm{out}}d_{\mathrm{in}})\) work for Contrast scores.
+- `O(d_in^2)` work for Hessian correlations, and
+- `O(d_out * d_in)` work for Contrast scores.
 
 These operations do not change the asymptotic complexity of the SparseGPT pruning step.
 
@@ -188,10 +181,7 @@ The repository keeps the SparseLLM-style OPT entry point.
 ### Example: OPT-125M
 
 ```bash
-python opt_main.py \
-    --model facebook/opt-125m \
-    --dataset c4 \
-    --sparsity 0.8
+python opt_main.py     --model facebook/opt-125m     --dataset c4     --sparsity 0.8
 ```
 
 Main inherited arguments:
@@ -206,11 +196,11 @@ The modified pruning implementation contains the VHHP/CHHP scoring path used for
 
 The implementation exposes the contrast strength through the code-level parameter `ncontrast`.
 
-The manuscript expresses the Contrast Manifold as
+The manuscript expresses the Contrast Manifold as:
 
-$$
-V_{ki} = \bar{w}_{ki}^{\,2n+1}.
-$$
+```text
+V(k, i) = w_bar(k, i)^(2n + 1)
+```
 
 The paper and code use slightly different indexing conventions for this exponent, so reproduction should follow the parameterization implemented in the repository.
 
@@ -244,13 +234,13 @@ Matched comparison on **OPT-125M**, **80% sparsity**, **C4 calibration**, **128 
 
 Under this protocol, the hybrid VHHP configuration improves over SparseGPT / OBS by approximately:
 
-- **51.3%** on WikiText-2.
-- **45.3%** on C4.
+- **51.3%** on WikiText-2
+- **45.3%** on C4
 
 It also improves over Wanda by approximately:
 
-- **30.7%** on WikiText-2.
-- **21.9%** on C4.
+- **30.7%** on WikiText-2
+- **21.9%** on C4
 
 ---
 
@@ -260,10 +250,10 @@ The current implementation is most effective when the structural score is applie
 
 The manuscript reports that:
 
-- MLP pruning benefits from the added structural priors.
-- Applying the same single-matrix score directly to attention does not provide the same benefit.
-- Performance becomes scale- and sparsity-dependent for billion-parameter models beyond roughly 70% sparsity.
-- Extreme sparsity can require more careful selection of the contrast exponent.
+- MLP pruning benefits from the added structural priors
+- Applying the same single-matrix score directly to attention does not provide the same benefit
+- Performance becomes scale- and sparsity-dependent for billion-parameter models beyond roughly 70% sparsity
+- Extreme sparsity can require more careful selection of the contrast exponent
 
 Future extensions proposed in the manuscript include coupled QK/VO masking, head-level contrast, per-head uniqueness, and adaptive contrast scheduling.
 
