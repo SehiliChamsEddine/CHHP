@@ -1,10 +1,8 @@
-# VHHP: Structural-Prior-Augmented Hessian Pruning for Large Language Models
+# CHHP: Contrast-Hessian Hybrid Pruning
 
-This repository contains the implementation of our Hessian-based post-training pruning framework for large language models. The codebase is built on top of **SparseLLM** and uses the **SparseGPT / Optimal Brain Surgeon (OBS)** recovery mechanism.
+This repository contains the implementation of **Contrast-Hessian Hybrid Pruning (CHHP)**, a structural-prior-augmented second-order framework for post-training compression of large language models. The codebase is built on top of **SparseLLM** and uses the **SparseGPT / Optimal Brain Surgeon (OBS)** recovery mechanism.
 
-> **Naming note:** the current manuscript refers to the method as **Contrast-Hessian Hybrid Pruning (CHHP)**. This repository is named **VHHP**.
-
-VHHP improves the SparseGPT pruning score by adding two lightweight structural priors computed from the same calibration Hessian:
+CHHP improves the SparseGPT pruning score by adding two lightweight structural priors computed from the same calibration Hessian:
 
 - **Contrast Manifold**: emphasizes row-dominant weights and suppresses weak background weights.
 - **Feature Uniqueness**: penalizes weights connected to highly correlated, redundant input channels.
@@ -29,7 +27,7 @@ SparseGPT uses the OBS importance score:
 S_base(k, i) = w(k, i)^2 / [H^(-1)](i, i)
 ```
 
-VHHP augments this score with two structural terms.
+CHHP augments this score with two structural terms.
 
 ### 1. Contrast Manifold
 
@@ -98,7 +96,7 @@ delta_w = - ( w(k, i) / [H^(-1)](i, i) ) * H^(-1)(:, i)
 
 ## MLP-Aware Hybrid Pruning
 
-The current best-performing configuration applies VHHP to the **MLP sublayers** while keeping standard SparseGPT scoring for **multi-head attention**.
+The current best-performing configuration applies CHHP to the **MLP sublayers** while keeping standard SparseGPT scoring for **multi-head attention**.
 
 ```text
 Transformer Layer
@@ -110,17 +108,17 @@ Transformer Layer
 │   └── out_proj -> SparseGPT / OBS
 │
 └── MLP
-    ├── fc1 -> VHHP Champion Score
-    └── fc2 -> VHHP Champion Score
+    ├── fc1 -> CHHP Champion Score
+    └── fc2 -> CHHP Champion Score
 ```
 
-This distinction is important because query and key projections are coupled inside the attention softmax, while the current VHHP score operates on one weight matrix at a time.
+This distinction is important because query and key projections are coupled inside the attention softmax, while the current CHHP score operates on one weight matrix at a time.
 
 ---
 
 ## SparseLLM Integration
 
-VHHP is implemented as a modified local pruning solver inside the **SparseLLM ADMM framework**.
+CHHP is implemented as a modified local pruning solver inside the **SparseLLM ADMM framework**.
 
 The overall pipeline is:
 
@@ -135,7 +133,7 @@ Compute pruning scores
       │
       ├── Attention -> SparseGPT / OBS
       │
-      └── MLP       -> VHHP Champion Score
+      └── MLP       -> CHHP Champion Score
       │
       ▼
 Select pruning mask
@@ -190,7 +188,7 @@ Main inherited arguments:
 - `--dataset`: calibration/evaluation dataset.
 - `--sparsity`: target sparsity level.
 
-The modified pruning implementation contains the VHHP/CHHP scoring path used for MLP pruning.
+The modified pruning implementation contains the CHHP scoring path used for MLP pruning.
 
 ### Contrast Parameter
 
@@ -230,9 +228,9 @@ Matched comparison on **OPT-125M**, **80% sparsity**, **C4 calibration**, **128 
 | Magnitude | 4859.41 | 2444.93 |
 | SparseGPT / OBS | 1686.32 | 857.79 |
 | Wanda | 1183.86 | 600.80 |
-| SparseGPT-attn + VHHP/CHHP-MLP | **819.92** | **469.52** |
+| SparseGPT-attn + CHHP-MLP | **819.92** | **469.52** |
 
-Under this protocol, the hybrid VHHP configuration improves over SparseGPT / OBS by approximately:
+Under this protocol, the hybrid CHHP configuration improves over SparseGPT / OBS by approximately:
 
 - **51.3%** on WikiText-2
 - **45.3%** on C4
@@ -261,7 +259,7 @@ Future extensions proposed in the manuscript include coupled QK/VO masking, head
 
 ## Citation
 
-If you use this code in your research, please cite our work:
+If you use CHHP in your research, please cite our work:
 
 ```bibtex
 @misc{sehili2026chhp,
